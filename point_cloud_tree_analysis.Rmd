@@ -133,6 +133,7 @@ tree_sf$Z <- trees$height
 summary(trees$Z)
 ```
 
+### Exploratory Viz to view growth stages & individual trees
 Viz: Viewing Longleaf Pine Growth Stages (crowns missing so not an accurate representation)
 ```{r}
 # assign growth stages - crowns missing so not an accurate representation
@@ -197,6 +198,7 @@ poly <- st_as_sfc(bbox)
 st_crs(poly) <- 32617
 mapview(poly, map.types = "Esri.WorldImagery", col.regions = "red", alpha.regions = 0.3)
 ```
+
 
 
 ### Step 7-8: Extracts dbh slice for each tree location, filters DBH slices based on params, and fits circle to XY coords
