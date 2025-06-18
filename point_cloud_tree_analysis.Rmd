@@ -1,0 +1,509 @@
+---
+title: "Point Cloud Tree Analysis"
+author: "Wade Sedgwick"
+date: "2025-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# Load libraries
+library(lidR)
+library(raster)
+library(sp)
+library(rgdal)
+library(rgl)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ForestTools)
+library(TreeLS)
+library(dbscan)
+library(viridis)
+library(mapview)
+library(sf)
+```
+
+### Step 1-4: load point cloud, classify ground, generate DTM & normalize height
+```{r}
+las_file <- '/Volumes/ML_data/carbon/2025 04 LLP surveys/orthomosaics and point clouds/point clouds/millpond big pine 100m point_cloud/20250410 millpond big pine_group1_densified_point_cloud_part_1.las'
+
+# 1. read las file
+las <- readLAS(las_file)
+
+# 2. classify ground using CSF (cloth simulation)
+las <- classify_ground(las, csf()) # classifies ground to value of 2
+
+# 3. generate DTM
+dtm <- rasterize_terrain(las, res = 0.25, algorithm = tin())
+# tin (Delaunay triangulation) performs linear interpolation within each triangle
+
+# 4. normalize height (create CHM)
+las_norm <- normalize_height(las, dtm)
+```
+
+```{r}
+# viewing area on a satellite map
+bbox <- st_bbox(las)
+poly <- st_as_sfc(bbox)
+st_crs(poly) <- 32617
+mapview(poly, map.types = "Esri.WorldImagery", col.regions = "red", alpha.regions = 0.3)
+```
+
+Algorithms for classifying ground:
+- noise classification alg.
+  - sor(statistical outlier removal) - general outliers
+  - ivf(isolated voxel filter) - isolated/noisy points
+- ground classification alg.
+  - pmf(progressive morphological filter) - flat to rolling terrain
+  - csf(cloth simulation filter) - complex/mountainous terrain
+  - mcc(multiscale curvature classification) - natural & variable
+    - use mcc() when pmf() struggles with over-filtering, or csf() is too smooth
+
+### Step 5: Remove Outliers + Ground Points from Normalized Data
+```{r}
+# print
+table(las_norm@data$Classification)
+
+# remove ground points
+las_nonground <- filter_poi(las_norm, Classification != 2)
+
+# get max canopy height (98th percentile)
+canopy_max <- quantile(las_nonground$Z, probs = .98, na.rm = TRUE)
+
+# keep relevant above-ground points
+las_filtered <- filter_poi(las_nonground, Z > 0 & Z < (canopy_max + 10))
+
+# classify noise using SOR algorithm
+las_filtered <- classify_noise(las_filtered, algorithm = sor(k = 8, m = 2)) # classifies noise to value of 18
+# uses Statistical Outliers Removal method - computes mean distance to KNN
+
+# remove noise
+table(las_filtered@data$Classification)
+las_filtered <- filter_poi(las_filtered, Classification != 18)
+summary(las_filtered$Z)
+
+plot(las_filtered, color = "Classification")
+# plot(las_norm, color = "Classification")
+rglwidget()
+```
+
+
+```{r}
+# compare histogram of heights before & after filtering
+par(mfrow = c(1, 2))
+hist(las_norm$Z, breaks = 50, main = "Before Filtering")
+hist(las_filtered$Z, breaks = 50, main = "After Filtering")
+
+plot(las_filtered)
+rglwidget()
+```
+
+
+### Step 6: CHM & Tree Detection
+```{r}
+# generate DSM
+dsm <- rasterize_canopy(las_filtered, res = 0.25, algorithm = p2r()) # points to raster method
+
+# DSM = CHM
+chm <- dsm
+
+# storing na values as 0
+# chm[is.na(chm[])] <- 0
+
+# clean CHM - removes outer rows & columns that are NA
+# chm_clean <- terra::trim(chm)
+
+summary(chm$Z)
+
+# variable window size - scales proportionally to tree height
+vwf_safe <- function(x) pmax(0.2*x, 1)
+
+# local max filter - only identifies trees and outputs height and geometry
+trees <- locate_trees(chm, lmf(ws = vwf_safe, hmin = 1.37))
+
+# extract tree heights
+tree_sf <- st_as_sf(trees, coords = c("x", "y"), crs = crs(chm))
+tree_sf$Z <- trees$height
+
+summary(trees$Z)
+```
+
+Viz: Viewing Longleaf Pine Growth Stages (crowns missing so not an accurate representation)
+```{r}
+# assign growth stages - crowns missing so not an accurate representation
+summary_table <- trees %>%
+  mutate(
+    Growth_Stage = cut(
+      Z,
+      breaks = c(-Inf, 0.5, 3, 10, 20, Inf),
+      labels = c("Grass Stage (<0.5m)", "Bottlebrush (0.5-3m)", "Sapling (3-10m)",
+                 "Pole (10-20m)", "Mature (>20m)"),
+      right = FALSE
+    )
+  ) %>%
+  st_drop_geometry() %>% 
+  count(Growth_Stage, name = "Count", .drop = FALSE)
+
+print(summary_table)
+```
+
+Viz: visualize individual tree point cloud
+```{r}
+# display a point cloud of a tree - some trees will require wider area around stem
+# extract XYZ and bind to the original sf object
+tree_sf <- tree_sf %>% 
+  bind_cols(st_coordinates(tree_sf) %>% as_tibble())
+
+# filter Z > 10
+tree_slice <- tree_sf %>% 
+  filter(Z > 10) %>% 
+  slice(2)
+
+coords <- st_coordinates(tree_10m)
+
+
+# crop a 3 m x 3 m area around the stem
+las_crop <- clip_rectangle(las_filtered,
+                             xleft = coords[1] - 1.5, 
+                             xright = coords[1] + 1.5,
+                             ybottom = coords[2] - 1.5, 
+                             ytop = coords[2] + 1.5)
+
+# filter Z/height to btwn 1.15 and 1.5 m
+las_crop_dbh <- filter_poi(las_crop, Z >= 1.15 & Z <= 1.5)
+
+# plotting tree
+plot(las_crop, color = "Z", pal = viridis::viridis(100))
+rglwidget()
+```
+
+
+```{r}
+# plotting DBH slice
+plot(las_crop_dbh, color = "Z", pal = viridis::viridis(100))
+rglwidget()
+```
+
+
+```{r}
+# plotting individual tree on a satellite map
+bbox <- st_bbox(las_crop)
+poly <- st_as_sfc(bbox)
+st_crs(poly) <- 32617
+mapview(poly, map.types = "Esri.WorldImagery", col.regions = "red", alpha.regions = 0.3)
+```
+
+
+### Step 7-8: Extracts dbh slice for each tree location, filters DBH slices based on params, and fits circle to XY coords
+```{r}
+# extract dbh slice per known tree location of point cloud
+tree_coords <- st_coordinates(tree_sf)
+tree_data <- cbind(tree_sf, tree_coords) %>%
+  st_drop_geometry()
+
+# parameters
+dbh_height <- 1.37       # breast height
+dbh_thickness <- 0.2     # +/- 10cm slice
+dbh_radius <- 0.4        # 40cm horizontal buffer around tree center
+
+all_slices <- list()
+
+# Step 8: filters DBH slices based on parameters
+for (i in seq_len(nrow(tree_data))) {
+  x0 <- tree_data$X[i]
+  y0 <- tree_data$Y[i]
+  id <- tree_data$treeID[i]
+  
+  # subset all points within 40 cm horizontally
+  local_slice <- clip_circle(las_filtered,
+                             xcenter = x0, ycenter = y0, radius = dbh_radius)
+  
+  # filter vertically near DBH height
+  local_slice <- filter_poi(local_slice, Z >= (dbh_height - dbh_thickness / 2) & Z <= (dbh_height + dbh_thickness / 2))
+  
+  # stores slice if it has enough points
+  if (npoints(local_slice) > 10) {
+    slice_df <- as.data.frame(local_slice@data)
+    slice_df$treeID <- id
+    all_slices[[length(all_slices) + 1]] <- slice_df
+  }
+}
+
+dbh_slices_df <- bind_rows(all_slices)
+
+
+# get the first 10 treeIDs
+n <- 10
+valid_ids <- dbh_slices_df %>%
+  distinct(treeID) %>%
+  arrange(treeID) %>%
+  slice(1:n) %>%
+  pull(treeID)
+
+# plot only those trees to visualize roundness
+ggplot(filter(dbh_slices_df, treeID %in% valid_ids), aes(x = X, y = Y)) +
+  geom_point(aes(color = rgb(R / 65535, G / 65535, B / 65535)), size = 0.6) +
+  scale_color_identity() +
+  facet_wrap(~ treeID, scales = "free") +
+  theme_minimal() +
+  labs(title = paste("DBH Slices (with RGB values) – First", n, "Trees"),
+       x = "X", y = "Y")
+
+
+all_dbhs <- list()
+
+# Step 8: extracts DBH estimates using RANSAC circle-fitting method and fits circle to XY coords - uses TreeLS library
+for (tree_id in unique(dbh_slices_df$treeID)) {
+  pts <- dbh_slices_df %>% filter(treeID == tree_id)
+  las_tree <- LAS(pts, header = las_norm@header)
+  las_tree <- add_attribute(las_tree, rep(1L, nrow(pts)), "Stem")
+
+  result <- tryCatch({
+    tlsInventory(las = las_tree, dh = dbh_height, dw = dbh_radius, hp = 1,
+                 d_method = shapeFit(shape = "circle", algorithm = "ransac")) # random sample consensus - resamples until subset only has inliers
+  }, error = function(e) NULL)
+  
+  if (!is.null(result)) {
+    df <- as.data.frame(result)
+    df$treeID <- tree_id
+    all_dbhs[[length(all_dbhs)+1]] <- df
+  }
+}
+
+dbh_result_df <- bind_rows(all_dbhs)
+dbh_result_df$DBH_cm <- round(dbh_result_df$Radius * 2 * 100, 1)
+
+# visualize
+head(dbh_result_df, 2)
+head(dbh_slices_df, 2)
+```
+
+### Exploratory viz to show DBH outliers
+```{r}
+# exploratory - heights compared to DBH to see how far off the heights are
+merged_df <- dbh_result_df %>%
+  left_join(tree_sf %>% st_drop_geometry() %>% select(treeID, Z), by = "treeID") %>% 
+  mutate(Z_pred_m = (1.3 + exp(0.8936 + 0.8096 * log(DBH_cm))) / 3.28084,
+         Z_error = Z - Z_pred_m)
+
+```
+
+#### Filtering trees with DBH greater than than 90 cm to view outliers
+
+```{r}
+
+# showing trees with DBH > 90 cm
+# Filter trees with DBH > 90 cm
+big_trees <- dbh_result_df %>% filter(DBH_cm > 90)
+
+# Convert to sf points
+big_trees_sf <- st_as_sf(big_trees, coords = c("X", "Y"), crs = 32617)
+
+# Create buffer around each tree (e.g., 1 m radius)
+big_tree_buffers <- st_buffer(big_trees_sf, dist = 1)
+
+# Clip all the trees using the union of the buffers
+big_tree_area <- st_union(big_tree_buffers)
+
+# Clip LAS points within those areas
+big_tree_las <- clip_roi(las_filtered, big_tree_area)
+
+plot(big_tree_las, color = "Z", pal = viridis::viridis(100))
+rglwidget()
+
+```
+
+```{r}
+# showing trees with DBH greater than 90 cm
+# Choose specific rows by index (e.g., rows 1 to 3)
+idx <- seq(1, nrow(big_trees))
+
+
+
+# Buffer and plot each tree
+for (i in idx) {
+  pt <- st_point(c(big_trees$X[i], big_trees$Y[i]))
+  sf_pt <- st_sfc(pt, crs = 32617) |> st_buffer(dist = 1)
+  las_tree <- clip_roi(las_filtered, sf_pt)
+
+  if (npoints(las_tree) < 10) next
+
+  plot(las_tree, color = "Z", pal = viridis::viridis(100))
+  print(rglwidget())
+  readline("Press [Enter] for next tree...")
+}
+
+```
+
+```{r}
+# viewing bottom 2 meters of trees with DBH greater than 90 cm with horizontal plane at 1.37 m
+idx <- seq(1, 6)
+
+for (i in idx) {
+  # Create buffered point around tree location
+  pt <- st_point(c(big_trees$X[i], big_trees$Y[i]))
+  sf_pt <- st_sfc(pt, crs = 32617) |> st_buffer(dist = 1)
+  
+  # Clip LAS and filter to bottom 5 meters
+  las_tree <- clip_roi(las_filtered, sf_pt)
+  las_bottom <- filter_poi(las_tree, Z <= 2)
+
+  if (npoints(las_bottom) < 10) next  # Skip if too few points
+
+  # Plot just the bottom 5 meters
+  plot(las_bottom, color = "Intensity", pal = rep("gray", 100))
+  planes3d(a = 0, b = 0, c = 1, d = -1.37, col = "red", alpha = 0.9)
+  print(rglwidget())
+  readline("Press [Enter] for next tree...")
+}
+
+```
+
+#### Plotting DBH slices to identify outliers
+
+```{r}
+# plotting slices all centered on (0,0)
+dbh_slices_centered <- dbh_slices_df %>%
+  inner_join(dbh_result_df %>% select(treeID, X_center = X, Y_center = Y), by = "treeID") %>%
+  mutate(
+    X_rel = X - X_center,
+    Y_rel = Y - Y_center
+  )
+
+# plotting DBH slices centered, colors representing true RGB color values
+ggplot(dbh_slices_centered, aes(x = X_rel, y = Y_rel)) +
+  geom_point(aes(color = rgb(R / 65535, G / 65535, B / 65535)), size = 0.6, alpha = 0.8) +
+  scale_color_identity() +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "All DBH Slices Centered at (0, 0)", x = "X (centered)", y = "Y (centered)")
+
+library(ggforce)
+
+# plotting centered slices with fitted circles
+ggplot(dbh_slices_centered, aes(x = X_rel, y = Y_rel)) +
+  geom_point(aes(color = rgb(R / 65535, G / 65535, B / 65535)), size = 0.6, alpha = 0.8) +
+  geom_circle(data = dbh_result_df, aes(x0 = 0, y0 = 0, r = Radius), 
+              color = "red", inherit.aes = FALSE, alpha = 0.5) +
+  scale_color_identity() +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "All Centered DBH Slices with Fitted Circles", x = "Centered X", y = "Centered Y")
+
+# plot showing the different trees to reveal outliers
+ggplot(dbh_slices_centered, aes(x = X_rel, y = Y_rel, color = factor(treeID))) +
+  geom_point(size = 0.6, alpha = 0.8) +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "DBH Slices Centered by Tree(n=150)", x = "X (meters)", y = "Y (meters)", color = "Tree ID")
+
+## filter to remove green point cloud points - some trees will have green vegetation at the 1.37 m height
+
+```
+
+### Step 10: Filtering DBH less than 90 cm and using biomass alometric equation from Chojnacky et al. 2014 for southern pines (Done with outliers)
+
+```{r}
+# Filter DBHs < 90 cm
+small_trees <- dbh_result_df %>% filter(DBH_cm < 90)
+
+# Apply allometric equation
+small_trees <- small_trees %>%
+  mutate(
+    AGB_kg = 0.0509 * (DBH_cm ^ 2.5433),
+    Carbon_kg = 0.5 * AGB_kg,
+    AGB_min = AGB_kg * 0.8,
+    AGB_max = AGB_kg * 1.2,
+    Carbon_min = Carbon_kg * 0.8,
+    Carbon_max = Carbon_kg * 1.2
+  )
+
+small_trees %>% select(treeID, DBH_cm, AGB_kg, Carbon_kg) %>% head()
+
+carbon_summary <- data.frame(
+  Stat = c("Estimated", "Min", "Max"),
+  Carbon_tons = round(c(
+    sum(small_trees$Carbon_kg) / 1000,
+    sum(small_trees$Carbon_min) / 1000,
+    sum(small_trees$Carbon_max) / 1000
+  ), 2)
+)
+
+print(carbon_summary)
+# only using DBH has ~20-30% accuracy, whereas with height, it has ~10-15% accuracy
+
+```
+
+```{r}
+# viewing area on satellite map
+bbox <- st_bbox(las)
+poly <- st_as_sfc(bbox)
+st_crs(poly) <- 32617
+mapview(poly, map.types = "Esri.WorldImagery", col.regions = "red", alpha.regions = 0.3)
+```
+
+
+
+### Visualize a point cloud for a single tree - uses convex hull method vs RANSAC using tlsInventory()
+```{r}
+# visualizing one tree point cloud
+tree_pt <- dplyr::filter(tree_sf, treeID == 16)
+buffer_radius <- 0.5
+tree_buf <- st_buffer(tree_pt, dist = buffer_radius)
+
+# Clip the LAS file to the buffer
+tree_las <- clip_roi(las, tree_buf)
+
+# normalize
+las_norm_pt <- normalize_height(tree_las, dtm)  # dtm is a raster or Terrain Model
+
+# slice 1.15 to 1.5 meters
+dbh_slice_pt <- filter_poi(las_norm_pt, Z >= 1.15 & Z <= 1.5)
+
+# extract x and y from dbh slice
+xyz <- dbh_slice_pt@data[, c("X", "Y")]
+
+# calculating DBH for the chosen tree
+if (nrow(xyz) >= 3) {
+  # Fit a minimum enclosing circle using convex hull method
+  ch <- chull(xyz)
+  ch <- c(ch, ch[1])
+  hull_pts <- xyz[ch, ]
+
+  # Approximate DBH as diameter of bounding circle
+  centroid <- colMeans(hull_pts)
+  distances <- sqrt((hull_pts[,1] - centroid[1])^2 + (hull_pts[,2] - centroid[2])^2)
+  dbh_est <- 2 * max(distances)  # in meters
+  dbh_cm <- dbh_est * 100        # convert to cm
+
+  cat("Estimated DBH:", round(dbh_cm, 1), "cm\n")
+} else {
+  cat("Not enough points in DBH slice.\n")
+}
+
+plot(xyz)
+plot(dbh_slice_pt)
+rglwidget()
+
+```
+
+```{r}
+# plotting individual tree on a satellite map
+# extent as a bounding box
+bbox <- st_bbox(dbh_slice_pt)
+
+# Convert to an sf polygon
+poly <- st_as_sfc(bbox)
+
+# Set coordinate ref system
+st_crs(poly) <- 32617
+
+mapview(poly, map.types = "Esri.WorldImagery", col.regions = "red", alpha.regions = 0.3)
+```
+
+
